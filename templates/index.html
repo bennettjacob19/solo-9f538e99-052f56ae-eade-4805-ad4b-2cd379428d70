@@ -19,6 +19,7 @@
 </head>
 <body>
 <h1>站台终端窄带组播补传演练</h1>
+<p class="small">操作页（上传/登记/发帧/下载）　·　<a href="{{ url_for('monitor_page') }}">值班员监看页（只读）</a></p>
 
 {% with msgs = get_flashed_messages() %}
   {% for m in msgs %}<div class="flash">{{ m }}</div>{% endfor %}
@@ -71,7 +72,7 @@
     <td>{% if t.missing %}{% for c in t.missing %}#{{ c }} {% endfor %}{% else %}<span class="ok">无</span>{% endif %}</td>
     <td>{{ t.total_decodes }}</td>
     <td>{% if t.completed %}<span class="ok">SHA-256 相符，已替换旧图</span>{% else %}<span class="bad">未收齐</span>{% endif %}</td>
-    <td><a href="{{ url_for('download', tid=loop.index0) }}">下载</a></td>
+    <td><a href="{{ url_for('download', tid=loop.index0, generation=generation) }}">下载</a></td>
   </tr>
   {% endfor %}
 </table>

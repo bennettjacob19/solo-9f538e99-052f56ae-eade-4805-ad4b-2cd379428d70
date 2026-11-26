@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>窄带补传监看（值班员只读页）</title>
+<style>
+  body { font-family: system-ui, "Noto Sans CJK SC", sans-serif; margin: 1.2rem auto; max-width: 1080px; color: #222; }
+  h1 { font-size: 1.35rem; } h2 { font-size: 1.05rem; border-bottom: 2px solid #4682b4; padding-bottom: .2rem; margin-top: 1.6rem; }
+  table { border-collapse: collapse; margin: .5rem 0; width: 100%; }
+  th, td { border: 1px solid #bbb; padding: .3rem .55rem; font-size: .9rem; text-align: left; vertical-align: top; }
+  th { background: #eaf2f8; }
+  .ok { color: #1a7f1a; font-weight: 600; } .bad { color: #b03030; font-weight: 600; }
+  .card { border: 1px solid #ccc; border-radius: 6px; padding: .7rem .9rem; margin: .7rem 0; }
+  code { background: #f2f2f2; padding: 0 .3em; border-radius: 3px; }
+  .small, li { font-size: .88rem; }
+  .bar { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; padding: .5rem .7rem; border: 1px solid #ccc; border-radius: 6px; background: #fafafa; }
+  .dot { display: inline-block; width: .7rem; height: .7rem; border-radius: 50%; background: #bbb; margin-right: .35rem; }
+  .dot.on { background: #2e9e44; } .dot.off { background: #c0392b; }
+  button { padding: .35rem .8rem; border-radius: 4px; border: 1px solid #4682b4; background: #eaf2f8; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  .toast { display: none; background: #fdecea; border: 1px solid #c0392b; color: #8a1f1f; padding: .55rem .8rem; border-radius: 5px; margin: .6rem 0; }
+  .muted { color: #777; }
+  .round-meta { font-weight: 600; }
+  .frames { margin: .25rem 0 .25rem 1.2rem; padding: 0; }
+  a.dl { white-space: nowrap; }
+</style>
+</head>
+<body>
+<h1>站台终端窄带组播补传 · 监看页 <span class="small muted">（只读，不影响发帧/下载）</span></h1>
+<p class="small"><a href="{{ url_for('index') }}">← 返回操作页</a></p>
+
+<div id="staleToast" class="toast">
+  该终端已<b>换图或重新登记</b>，旧下载链接已失效，下载已被拒绝。请刷新监看页获取最新链接。
+  <button id="reloadBtn" type="button">立即刷新</button>
+</div>
+
+<div class="bar">
+  <span><span id="netDot" class="dot"></span><span id="netText">未连接</span></span>
+  <span class="small">代次 generation=<code id="genLabel">—</code></span>
+  <span class="small">内容版本 revision=<code id="revLabel">—</code></span>
+  <span class="small">轮次总数=<code id="totalLabel">0</code></span>
+  <span class="small">空闲请求（60 秒窗）=<code id="idleCountLabel">0</code>/6</span>
+  <button id="pauseBtn" type="button">暂停自动刷新</button>
+</div>
+
+<h2>各站当前进度</h2>
+<div id="progressHost"><p class="small muted">等待首次数据…</p></div>
+
+<h2>轮次记录（每次最多 {{ page_size }} 条，按游标向更早翻页）</h2>
+<div id="roundsHost"><p class="small muted">等待首次数据…</p></div>
+<p>
+  <button id="olderBtn" type="button" disabled>读取更早的 {{ page_size }} 轮</button>
+  <button id="refreshRoundsBtn" type="button">刷新当前轮次</button>
+</p>
+
+<script src="{{ url_for('static', filename='poll.js') }}"></script>
+<script>
+(function () {
+  "use strict";
+  var PAGE_SIZE = {{ page_size }};
+
+  var els = {
+    netDot: document.getElementById("netDot"),
+    netText: document.getElementById("netText"),
+    gen: document.getElementById("genLabel"),
+    rev: document.getElementById("revLabel"),
+    total: document.getElementById("totalLabel"),
+    idle: document.getElementById("idleCountLabel"),
+    pause: document.getElementById("pauseBtn"),
+    older: document.getElementById("olderBtn"),
+    refreshRounds: document.getElementById("refreshRoundsBtn"),
+    progress: document.getElementById("progressHost"),
+    rounds: document.getElementById("roundsHost"),
+    toast: document.getElementById("staleToast"),
+    reloadBtn: document.getElementById("reloadBtn")
+  };
+
+  var view = {
+    generation: null,      // 当前监看页所属代次；收到 409 即整体重装载
+    revision: null,
+    totalRounds: 0,
+    rounds: [],            // 已装载的轮次（新→旧）
+    nextBefore: null,      // 下一次向更早翻页的游标（轮号上界，排他）
+    hasMore: false
+  };
+  var seq = 0;             // 请求序号：迟到的旧回复直接丢弃
+
+  function setNet(online) {
+    els.netDot.className = "dot " + (online ? "on" : "off");
+    els.netText.textContent = online ? "连接正常" : "断线/等待重连";
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function renderProgress(state) {
+    if (!state.image) {
+      els.progress.innerHTML = '<p class="small muted">尚未上传新图。</p>';
+      return;
+    }
+    var html = '<div class="card small">新图 <b>' + esc(state.image.name) + '</b>（' +
+      state.image.size + ' 字节，' + state.image.n_chunks + ' 块）<br>SHA-256 <code>' +
+      esc(state.image.sha256) + '</code></div>';
+    if (!state.terminals.length) {
+      html += '<p class="small muted">尚未登记终端。</p>';
+    } else {
+      html += '<table><tr><th>终端</th><th>已收块</th><th>缺块</th><th>累计解码</th><th>校验</th><th>下载</th></tr>';
+      state.terminals.forEach(function (t, i) {
+        html += '<tr><td>' + esc(t.name) + '</td>' +
+          '<td>' + (t.owned.length ? t.owned.map(function (c) { return '#' + c; }).join(' ') : '—') + '</td>' +
+          '<td>' + (t.missing.length ? t.missing.map(function (c) { return '#' + c; }).join(' ') : '<span class="ok">无</span>') + '</td>' +
+          '<td>' + t.total_decodes + '</td>' +
+          '<td>' + (t.completed ? '<span class="ok">已校验替换</span>' : '<span class="bad">未收齐</span>') + '</td>' +
+          '<td><a class="dl" data-tid="' + i + '" href="/terminal/' + i + '/download?generation=' +
+          view.generation + '">下载</a></td></tr>';
+      });
+      html += '</table>';
+    }
+    els.progress.innerHTML = html;
+  }
+
+  function roundCard(r) {
+    var frames = r.frames.map(function (f) { return '<li>' + esc(f) + '</li>'; }).join('');
+    var rows = r.terminals.map(function (t) {
+      var status = t.just_completed
+        ? '<span class="ok">本轮收齐并替换</span>'
+        : (t.completed ? '<span class="ok">此前已收齐</span>' : '<span class="bad">未收齐</span>');
+      return '<tr><td>' + esc(t.name) + '</td>' +
+        '<td>' + (t.before_missing.length ? t.before_missing.map(function (c) { return '#' + c; }).join(' ') : '无') + '</td>' +
+        '<td>' + (t.missed_frame ? '<span class="bad">漏第' + t.missed_frame + '帧；</span>' : '') +
+          (t.received.length ? t.received.join(' ') : '无') + '</td>' +
+        '<td>' + (t.decoded.length ? t.decoded.map(function (d) { return '第' + d[0] + '帧→#' + d[1]; }).join(' ') : '—') + '</td>' +
+        '<td>' + t.decodes + '/' + t.quota + '</td>' +
+        '<td>' + (t.after_missing.length ? t.after_missing.map(function (c) { return '#' + c; }).join(' ') : '<span class="ok">无</span>') + '</td>' +
+        '<td>' + status + '</td></tr>';
+    }).join('');
+    return '<div class="card"><div class="round-meta">第 ' + r.no + ' 轮（帧数上限 ' + r.frame_limit +
+      '，实发 ' + r.frames.length + ' 帧）' +
+      (r.fault ? ' <span class="bad">漏帧注入：' + esc(r.fault[0]) + ' 漏收第 ' + r.fault[1] + ' 帧</span>' : '') +
+      '</div><ol class="frames">' + frames + '</ol>' +
+      '<table><tr><th>终端</th><th>轮前缺块</th><th>实收帧</th><th>解回块</th><th>解码/额度</th><th>轮后缺块</th><th>结果</th></tr>' +
+      rows + '</table></div>';
+  }
+
+  function renderRounds() {
+    els.total.textContent = view.totalRounds;
+    if (!view.rounds.length) {
+      els.rounds.innerHTML = '<p class="small muted">当前代次还没有轮次记录。</p>';
+    } else {
+      els.rounds.innerHTML = view.rounds.map(roundCard).join('');
+    }
+    els.older.disabled = !view.hasMore;
+    els.older.textContent = view.hasMore ? ('读取更早的 ' + PAGE_SIZE + ' 轮（游标 before=' + view.nextBefore + '）')
+      : '没有更早的轮次';
+  }
+
+  function applyState(state, mySeq) {
+    if (mySeq !== seq) return;                 // 迟到回复：丢弃，绝不回退进度
+    view.generation = state.generation;
+    view.revision = state.revision;
+    view.totalRounds = state.total_rounds;
+    els.gen.textContent = state.generation;
+    els.rev.textContent = state.revision;
+    renderProgress(state);
+    // 轮次总数增长时只拉新增的那一段（至多 12 条），不重传已见轮次。
+    var knownMax = view.rounds.length ? view.rounds[0].no : 0;
+    if (state.total_rounds > knownMax) {
+      var grow = state.total_rounds - knownMax;
+      fetchRounds({ before: state.total_rounds + 1, limit: Math.min(PAGE_SIZE, grow) },
+        function (page) {
+          if (page.generation !== view.generation) return;
+          mergeNewRounds(page);
+        });
+    } else {
+      renderRounds();
+    }
+  }
+
+  function mergeNewRounds(page) {
+    // 仅追加新轮，按轮号去重；不改动"向更早翻页"的游标，避免覆盖手动翻页结果。
+    var seen = {};
+    view.rounds.forEach(function (r) { seen[r.no] = true; });
+    page.rounds.forEach(function (r) { if (!seen[r.no]) view.rounds.push(r); });
+    view.rounds.sort(function (a, b) { return b.no - a.no; });
+    view.totalRounds = page.total;
+    if (view.nextBefore === null && page.next_before !== null) {
+      view.nextBefore = page.next_before;
+      view.hasMore = page.has_more;
+    }
+    renderRounds();
+  }
+
+  function fetchRounds(opts, cb) {
+    var mySeq = ++seq;
+    var params = new URLSearchParams({ generation: String(view.generation), limit: String(opts.limit || PAGE_SIZE) });
+    if (opts.before != null) params.set("before", String(opts.before));
+    fetch("/api/rounds?" + params.toString(), { headers: { Accept: "application/json" } })
+      .then(function (resp) {
+        if (resp.status === 409) { location.reload(); return null; }
+        if (!resp.ok) throw new Error("rounds HTTP " + resp.status);
+        return resp.json();
+      })
+      .then(function (page) { if (page && cb) cb(page, mySeq); })
+      .catch(function () { setNet(false); });
+  }
+
+  // —— 轮询控制：连接正常 2 秒一次；连续 60 秒无变化则每个 60 秒窗最多 6 次 ——
+  var poller = new DrillPoller({
+    activeIntervalMs: 2000,
+    idleIntervalMs: 10000,
+    idleWindowMs: 60000,
+    idleWindowMaxRequests: 6,
+    request: function (ifNoneMatch, cb) {
+      var mySeq = ++seq;
+      var headers = { Accept: "application/json" };
+      // 仅在空闲复轮时才带条件头：命中则 304 空体，不重传进度/轮次。
+      if (ifNoneMatch) headers["If-None-Match"] = ifNoneMatch;
+      var url = "/api/state" + (view.generation == null ? "" : "?generation=" + encodeURIComponent(view.generation));
+      fetch(url, { headers: headers, cache: "no-store" })
+        .then(function (resp) {
+          if (resp.status === 409) { location.reload(); cb({ stale: true }); return; }
+          if (resp.status === 304) { cb({ notModified: true, seq: mySeq }); return; }
+          if (!resp.ok) throw new Error("state HTTP " + resp.status);
+          resp.json().then(function (data) { cb({ data: data, seq: mySeq }); });
+        })
+        .catch(function () { cb({ error: true, seq: mySeq }); });
+    },
+    onState: function (data, mySeq) {
+      setNet(true);
+      applyState(data, mySeq);
+    },
+    onNotModified: function () { setNet(true); },
+    onError: function () { setNet(false); },
+    onIdleCount: function (n) { els.idle.textContent = String(n); }
+  });
+
+  // 下载链接点击：若已换图/重新登记，服务端回 409，提示刷新并拒绝下载。
+  document.addEventListener("click", function (ev) {
+    var a = ev.target.closest && ev.target.closest("a.dl");
+    if (!a) return;
+    ev.preventDefault();
+    fetch(a.getAttribute("href"), { method: "GET" }).then(function (resp) {
+      if (resp.status === 409) {
+        els.toast.style.display = "block";
+        return null;
+      }
+      if (!resp.ok) throw new Error("download " + resp.status);
+      return resp.blob().then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var cd = resp.headers.get("Content-Disposition") || "";
+        var filename = "download";
+        if (cd.indexOf("filename") >= 0) {
+          filename = (cd.split("filename=")[1] || "download").replace(/"/g, "");
+        }
+        var tmp = document.createElement("a");
+        tmp.href = url;
+        tmp.download = filename;
+        document.body.appendChild(tmp); tmp.click(); tmp.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+      });
+    }).catch(function () { setNet(false); });
+  });
+
+  els.reloadBtn.addEventListener("click", function () { location.reload(); });
+  els.pause.addEventListener("click", function () {
+    if (poller.isPaused()) { poller.resume(); els.pause.textContent = "暂停自动刷新"; }
+    else { poller.pause(); els.pause.textContent = "恢复自动刷新"; }
+  });
+  els.older.addEventListener("click", function () {
+    if (view.generation == null || !view.hasMore) return;
+    fetchRounds({ before: view.nextBefore, limit: PAGE_SIZE }, function (page) {
+      if (page.generation !== view.generation) return;
+      page.rounds.forEach(function (r) { view.rounds.push(r); });
+      view.rounds.sort(function (a, b) { return b.no - a.no; });
+      view.hasMore = page.has_more;
+      view.nextBefore = page.next_before;
+      renderRounds();
+    });
+  });
+  els.refreshRounds.addEventListener("click", function () {
+    if (view.generation == null) return;
+    fetchRounds({ before: (view.rounds.length ? view.rounds[0].no : 0) + 1, limit: PAGE_SIZE }, mergeNewRounds);
+  });
+
+  poller.start();
+})();
+</script>
+</body>
+</html>
